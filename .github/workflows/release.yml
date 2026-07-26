@@ -30,7 +30,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -772,7 +772,7 @@ jobs:
 
       - name: Checkout scripts
         if: steps.r2.outputs.configured == 'true'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           sparse-checkout: scripts
 
