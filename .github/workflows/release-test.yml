@@ -1,6 +1,9 @@
 name: Release Test
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -20,26 +23,31 @@ jobs:
         include:
           - name: Windows x86_64
             os: windows-2022
+            asset_name: cc-switch-windows-x86_64
             sidecar_target: x86_64-pc-windows-msvc
             tauri_target: x86_64-pc-windows-msvc
             bundles: msi
           - name: Windows ARM64
             os: windows-11-arm
             arch: arm64
+            asset_name: cc-switch-windows-arm64
             sidecar_target: aarch64-pc-windows-msvc
             tauri_target: aarch64-pc-windows-msvc
             bundles: msi
             rust_target: aarch64-pc-windows-msvc
           - name: Linux x86_64
             os: ubuntu-22.04
+            asset_name: cc-switch-linux-x86_64
             sidecar_target: x86_64-unknown-linux-gnu
             bundles: appimage,deb,rpm
           - name: Linux ARM64
             os: ubuntu-22.04-arm
+            asset_name: cc-switch-linux-arm64
             sidecar_target: aarch64-unknown-linux-gnu
             bundles: appimage,deb,rpm
           - name: macOS Universal
             os: macos-14
+            asset_name: cc-switch-macos-universal
             sidecar_target: universal-apple-darwin
             tauri_target: universal-apple-darwin
             bundles: app,dmg
@@ -200,10 +208,91 @@ jobs:
           test -n "$(find release-test-assets -mindepth 1 -maxdepth 1 -type f -print -quit)"
           ls -lh release-test-assets
 
+      - name: Prefix release asset names
+        shell: bash
+        run: |
+          set -euo pipefail
+          for path in release-test-assets/*; do
+            filename=$(basename "$path")
+            mv "$path" "release-test-assets/${{ matrix.asset_name }}-$filename"
+          done
+
       - name: Upload test packages
         uses: actions/upload-artifact@v7
         with:
-          name: cc-switch-${{ matrix.os }}-${{ matrix.tauri_target || matrix.sidecar_target }}
+          name: ${{ matrix.asset_name }}
           path: release-test-assets/*
           if-no-files-found: error
           retention-days: 7
+
+  publish-preview:
+    name: Publish rolling main preview
+    if: github.ref == 'refs/heads/main'
+    needs: package
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download test packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: cc-switch-*
+          path: release-test-assets
+          merge-multiple: true
+
+      - name: Verify downloaded packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$(find release-test-assets -mindepth 1 -maxdepth 1 -type f -print -quit)"
+          ls -lh release-test-assets
+
+      - name: Update rolling preview release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIEW_TAG: main-preview
+        run: |
+          set -euo pipefail
+
+          tag_ref="repos/${GITHUB_REPOSITORY}/git/refs/tags/${PREVIEW_TAG}"
+          if gh api "${tag_ref}" >/dev/null 2>&1; then
+            gh api --method PATCH "${tag_ref}" \
+              -f sha="${GITHUB_SHA}" \
+              -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${PREVIEW_TAG}" \
+              -f sha="${GITHUB_SHA}" >/dev/null
+          fi
+
+          if ! gh release view "${PREVIEW_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${PREVIEW_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --title "CC Switch Main Preview" \
+              --prerelease \
+              --notes "Rolling unsigned preview packages built from the latest main branch."
+          fi
+
+          gh release upload "${PREVIEW_TAG}" release-test-assets/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+
+          find release-test-assets -mindepth 1 -maxdepth 1 -type f \
+            -exec basename {} \; | sort > current-assets.txt
+          gh release view "${PREVIEW_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json assets \
+            --jq '.assets[].name' | sort > published-assets.txt
+          comm -23 published-assets.txt current-assets.txt | while IFS= read -r asset_name; do
+            [ -n "${asset_name}" ] || continue
+            gh release delete-asset "${PREVIEW_TAG}" "${asset_name}" \
+              --repo "${GITHUB_REPOSITORY}" --yes
+          done
+
+          gh release edit "${PREVIEW_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "CC Switch Main Preview" \
+            --prerelease \
+            --notes "Rolling unsigned preview packages built from main commit ${GITHUB_SHA}. These packages are for testing only."
