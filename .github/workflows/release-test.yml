@@ -24,6 +24,7 @@ jobs:
           - name: Windows x86_64
             os: windows-2022
             asset_name: cc-switch-windows-x86_64
+            asset_count: 1
             sidecar_target: x86_64-pc-windows-msvc
             tauri_target: x86_64-pc-windows-msvc
             bundles: msi
@@ -31,6 +32,7 @@ jobs:
             os: windows-11-arm
             arch: arm64
             asset_name: cc-switch-windows-arm64
+            asset_count: 1
             sidecar_target: aarch64-pc-windows-msvc
             tauri_target: aarch64-pc-windows-msvc
             bundles: msi
@@ -38,16 +40,19 @@ jobs:
           - name: Linux x86_64
             os: ubuntu-22.04
             asset_name: cc-switch-linux-x86_64
+            asset_count: 3
             sidecar_target: x86_64-unknown-linux-gnu
             bundles: appimage,deb,rpm
           - name: Linux ARM64
             os: ubuntu-22.04-arm
             asset_name: cc-switch-linux-arm64
+            asset_count: 3
             sidecar_target: aarch64-unknown-linux-gnu
             bundles: appimage,deb,rpm
           - name: macOS Universal
             os: macos-14
             asset_name: cc-switch-macos-universal
+            asset_count: 2
             sidecar_target: universal-apple-darwin
             tauri_target: universal-apple-darwin
             bundles: app,dmg
@@ -195,27 +200,51 @@ jobs:
           fi
           "${command[@]}"
 
-      - name: Collect packages
+      - name: Collect release packages
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p release-test-assets
-          find src-tauri/target -type f \( \
-            -name '*.msi' -o -name '*.exe' -o -name '*.AppImage' -o \
-            -name '*.deb' -o -name '*.rpm' -o -name '*.dmg' -o \
-            -name '*.tar.gz' \) -print -exec cp {} release-test-assets/ \;
-          find src-tauri/target -type d -name '*.app' -print -exec ditto -c -k --sequesterRsrc --keepParent {} release-test-assets/ \; 2>/dev/null || true
-          test -n "$(find release-test-assets -mindepth 1 -maxdepth 1 -type f -print -quit)"
-          ls -lh release-test-assets
 
-      - name: Prefix release asset names
-        shell: bash
-        run: |
-          set -euo pipefail
-          for path in release-test-assets/*; do
-            filename=$(basename "$path")
-            mv "$path" "release-test-assets/${{ matrix.asset_name }}-$filename"
-          done
+          while IFS= read -r package; do
+            case "$package" in
+              *.msi) extension=msi ;;
+              *.AppImage) extension=AppImage ;;
+              *.deb) extension=deb ;;
+              *.rpm) extension=rpm ;;
+              *.dmg) extension=dmg ;;
+              *) echo "Unexpected package: $package" >&2; exit 1 ;;
+            esac
+
+            destination="release-test-assets/${{ matrix.asset_name }}.$extension"
+            if [ -e "$destination" ]; then
+              echo "Multiple packages resolved to $destination" >&2
+              exit 1
+            fi
+            cp "$package" "$destination"
+          done < <(
+            find src-tauri/target -type f -path '*/release/bundle/*' \( \
+              -name '*.msi' -o -name '*.AppImage' -o -name '*.deb' -o \
+              -name '*.rpm' -o -name '*.dmg' \
+            \) -print
+          )
+
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            app_path=$(find src-tauri/target -type d \
+              -path '*/release/bundle/macos/*.app' -print -quit)
+            test -n "$app_path"
+            ditto -c -k --sequesterRsrc --keepParent \
+              "$app_path" "release-test-assets/${{ matrix.asset_name }}.app.zip"
+          fi
+
+          actual_count=$(find release-test-assets -mindepth 1 -maxdepth 1 \
+            -type f | wc -l | tr -d ' ')
+          if [ "$actual_count" -ne "${{ matrix.asset_count }}" ]; then
+            echo "Expected ${{ matrix.asset_count }} release packages, found $actual_count" >&2
+            find release-test-assets -mindepth 1 -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
+          ls -lh release-test-assets
 
       - name: Upload test packages
         uses: actions/upload-artifact@v7
@@ -244,7 +273,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$(find release-test-assets -mindepth 1 -maxdepth 1 -type f -print -quit)"
+          cat > expected-assets.txt <<'EOF'
+          cc-switch-linux-arm64.AppImage
+          cc-switch-linux-arm64.deb
+          cc-switch-linux-arm64.rpm
+          cc-switch-linux-x86_64.AppImage
+          cc-switch-linux-x86_64.deb
+          cc-switch-linux-x86_64.rpm
+          cc-switch-macos-universal.app.zip
+          cc-switch-macos-universal.dmg
+          cc-switch-windows-arm64.msi
+          cc-switch-windows-x86_64.msi
+          EOF
+          find release-test-assets -mindepth 1 -maxdepth 1 -type f \
+            -exec basename {} \; | sort > actual-assets.txt
+          if ! diff -u expected-assets.txt actual-assets.txt; then
+            echo "Rolling preview asset set is incomplete or contains unexpected files" >&2
+            exit 1
+          fi
           ls -lh release-test-assets
 
       - name: Update rolling preview release
@@ -295,4 +341,4 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --title "CC Switch Main Preview" \
             --prerelease \
-            --notes "Rolling unsigned preview packages built from main commit ${GITHUB_SHA}. These packages are for testing only."
+            --notes "Rolling unsigned preview packages built from main commit ${GITHUB_SHA}. These packages are for testing only and are not code-signed or notarized."
